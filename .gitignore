@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+env.bak/
+venv.bak/
+
+# Models
+ckpt/
+models/
+GLM-TTS/ckpt/
+*.pt
+*.bin
+*.pth
+*.safetensors
+*.onnx
+
+# IDE
+.idea/
+.vscode/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

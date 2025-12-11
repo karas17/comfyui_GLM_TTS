@@ -1,0 +1,12 @@
+WeTextProcessing
+zhon
+zhconv
+inflect
+HyperPyYAML
+jieba
+pypinyin
+regex
+scipy
+soundfile
+huggingface_hub
+# onnxruntime-gpu # Optional: Uncomment if you don't have onnxruntime installed. ComfyUI often has it.
