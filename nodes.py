@@ -26,11 +26,47 @@ MAX_LLM_SEQ_INP_LEN = 750
 def set_seed(seed):
     import random
     import numpy as np
-    torch.manual_seed(seed)
+    try:
+        seed_int = int(seed)
+    except Exception:
+        seed_int = 0
+    max_seed = 2**32
+    seed_int = seed_int % max_seed
+    torch.manual_seed(seed_int)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    random.seed(seed)
-    np.random.seed(seed)
+        torch.cuda.manual_seed_all(seed_int)
+    random.seed(seed_int)
+    np.random.seed(seed_int)
+
+ASR_MODEL = None
+
+def auto_transcribe_reference_audio(file_path, language="zh"):
+    global ASR_MODEL
+    try:
+        import whisper
+    except Exception:
+        print("GLM-TTS: openai-whisper not available, skip auto transcription.")
+        return ""
+    if ASR_MODEL is None:
+        asr_device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            ASR_MODEL = whisper.load_model("small", device=asr_device)
+        except Exception as e:
+            print(f"GLM-TTS: failed to load Whisper model: {e}")
+            return ""
+    lang_arg = None if language == "auto" else language
+    try:
+        if lang_arg is None:
+            result = ASR_MODEL.transcribe(file_path)
+        else:
+            result = ASR_MODEL.transcribe(file_path, language=lang_arg)
+    except Exception as e:
+        print(f"GLM-TTS: Whisper transcription error: {e}")
+        return ""
+    text = result.get("text", "")
+    if not isinstance(text, str):
+        return ""
+    return text.strip()
 
 def nucleus_sampling(weighted_scores, top_p=0.8, top_k=25, temperature=1.0):
     prob, indices = [], []
@@ -383,6 +419,29 @@ class GLMTTSLoader:
                 spec.loader.exec_module(module)
                 return module
 
+            utils_init = os.path.join(glmtts_root, "utils", "__init__.py")
+            if os.path.exists(utils_init):
+                try:
+                    import utils.glm_g2p  # type: ignore
+                except Exception:
+                    spec_utils = importlib.util.spec_from_file_location("utils", utils_init)
+                    utils_mod = importlib.util.module_from_spec(spec_utils)
+                    utils_mod.__path__ = [os.path.dirname(utils_init)]
+                    spec_utils.loader.exec_module(utils_mod)
+                    sys.modules["utils"] = utils_mod
+
+            cosyvoice_pkg_dir = os.path.join(glmtts_root, "cosyvoice")
+            cosyvoice_init = os.path.join(cosyvoice_pkg_dir, "__init__.py")
+            if os.path.exists(cosyvoice_init):
+                for k in list(sys.modules.keys()):
+                    if k == "cosyvoice" or k.startswith("cosyvoice."):
+                        sys.modules.pop(k, None)
+                spec_cosy = importlib.util.spec_from_file_location("cosyvoice", cosyvoice_init)
+                cosy_mod = importlib.util.module_from_spec(spec_cosy)
+                cosy_mod.__path__ = [cosyvoice_pkg_dir]
+                spec_cosy.loader.exec_module(cosy_mod)
+                sys.modules["cosyvoice"] = cosy_mod
+
             cosy_frontend_mod = _load_module(
                 "glmtts_cosyvoice_frontend",
                 os.path.join(glmtts_root, "cosyvoice", "cli", "frontend.py"),
@@ -523,7 +582,6 @@ class GLMTTSSampler:
     CATEGORY = "GLM-TTS"
 
     def generate(self, model, text, seed, use_cache, sample_method, reference_audio=None, reference_text=""):
-        # Set seed
         set_seed(seed)
         
         frontend = model.frontend
@@ -532,82 +590,41 @@ class GLMTTSSampler:
         flow = model.flow
         sample_rate = model.sample_rate
 
-        # Prepare Prompt
-        prompt_text = ""
-        prompt_speech_feat = None
+        prompt_text = reference_text.strip() if isinstance(reference_text, str) else ""
+        speech_feat = None
         prompt_speech_token = None
         embedding = None
         
-        # If reference audio is provided
         if reference_audio is not None:
-            # ComfyUI AUDIO is {'waveform': tensor[batch, channels, samples], 'sample_rate': int}
-            ref_wav = reference_audio['waveform']
-            ref_sr = reference_audio['sample_rate']
-            
-            # Take first batch item, mix channels to mono if needed
-            ref_wav_mono = ref_wav[0] # [channels, samples]
+            ref_wav = reference_audio["waveform"]
+            ref_sr = reference_audio["sample_rate"]
+            ref_wav_mono = ref_wav[0]
             if ref_wav_mono.shape[0] > 1:
                 ref_wav_mono = torch.mean(ref_wav_mono, dim=0, keepdim=True)
-            
-            # Resample if needed
             if ref_sr != sample_rate:
                 resampler = torchaudio.transforms.Resample(orig_freq=ref_sr, new_freq=sample_rate).to(ref_wav_mono.device)
                 ref_wav_mono = resampler(ref_wav_mono)
-            
-            # Save to temp file because some frontend functions might expect file path 
-            # OR use the internal methods that accept tensor.
-            # frontend._extract_speech_token expects path usually? 
-            # checking glmtts_inference.py: frontend._extract_speech_token([item["prompt_speech"]]) -> list of paths
-            # Let's check frontend source if possible. 
-            # But wait, frontend._extract_speech_token calls speech_tokenizer.
-            
-            # Workaround: Save to temp file
             import tempfile
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 temp_path = f.name
-            
             torchaudio.save(temp_path, ref_wav_mono, sample_rate)
-            
             try:
-                # Extract features
-                # Note: frontend methods might expect 16k or 24k? 
-                # _extract_speech_feat uses sample_rate arg.
-                
                 prompt_speech_token = frontend._extract_speech_token([temp_path])
                 speech_feat = frontend._extract_speech_feat(temp_path, sample_rate=sample_rate)
                 embedding = frontend._extract_spk_embedding(temp_path)
-                
-                prompt_text = reference_text
                 if not prompt_text:
-                     # If no text provided for reference, it might degrade performance for zero-shot cloning if the model expects alignment?
-                     # GLM-TTS seems to support zero-shot.
-                     pass
-                     
+                    prompt_text = auto_transcribe_reference_audio(temp_path, language="zh")
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
         else:
-            # No reference audio - Use default prompt or fail?
-            # The model is "Zero-shot", implies it needs a prompt.
-            # If no prompt provided, we might need a default speaker.
-            # The inference script uses cache/history.
-            # If we don't have reference, maybe we can't generate?
-            # Or we use a built-in default?
-            # For now, let's assume user must provide audio OR we assume the model has some baked in default (unlikely for zero-shot).
-            # Actually, `glmtts_inference.py` example uses `prompt_speech` from jsonl.
-            # If `reference_audio` is None, we raise error or warn.
             raise ValueError("Reference audio is required for GLM-TTS Zero-shot generation.")
 
-        # Prepare Inputs
-        # Logic from jsonl_generate in glmtts_inference.py
-        
-        # Text Normalization
         prompt_text_norm = text_frontend.text_normalize(prompt_text)
         synth_text_norm = text_frontend.text_normalize(text)
         
         prompt_text_token = frontend._extract_text_token(prompt_text_norm + " ")
         
-        # Cache setup
         cache_speech_token = [prompt_speech_token.squeeze().tolist()]
         flow_prompt_token = torch.tensor(cache_speech_token, dtype=torch.int32).to(DEVICE)
         
@@ -634,10 +651,47 @@ class GLMTTSSampler:
             use_phoneme=model.text_frontend.use_phoneme # verify this attr exists or check initialization
         )
         
-        # tts_speech is tensor [1, samples]
-        # Convert to ComfyUI format: {'waveform': [batch, channels, samples], 'sample_rate': int}
-        
         out_wav = tts_speech.unsqueeze(0).cpu() # [1, 1, samples]
         
         return ({"waveform": out_wav, "sample_rate": sample_rate},)
+
+class GLMTTSASR:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "language": (["auto", "zh", "en"], {"default": "zh"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "transcribe"
+    CATEGORY = "GLM-TTS"
+
+    def transcribe(self, audio, language):
+        if audio is None:
+            return ("" ,)
+        waveform = audio["waveform"]
+        sample_rate = audio["sample_rate"]
+        wav_mono = waveform[0]
+        if wav_mono.shape[0] > 1:
+            wav_mono = torch.mean(wav_mono, dim=0, keepdim=True)
+        target_sr = 16000
+        if sample_rate != target_sr:
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr).to(wav_mono.device)
+            wav_mono = resampler(wav_mono)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            temp_path = f.name
+        torchaudio.save(temp_path, wav_mono.cpu(), target_sr)
+        try:
+            text = auto_transcribe_reference_audio(temp_path, language=language)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        if not isinstance(text, str):
+            text = ""
+        return (text, )
 
