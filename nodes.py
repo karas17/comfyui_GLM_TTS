@@ -1,13 +1,23 @@
 import os
 import sys
+import glob
 import torch
 import torchaudio
 import logging
+import importlib.util
 import folder_paths
 from functools import partial
 from transformers import AutoTokenizer, LlamaForCausalLM
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
+glmtts_src_candidates = [
+    os.path.join(current_dir, "glmtts_src"),
+    os.path.join(current_dir, "GLM-TTS"),
+]
+for _p in glmtts_src_candidates:
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+        break
 
 # Constants
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -324,6 +334,12 @@ class GLMTTSLoader:
                  if not os.path.exists(os.path.join(base_path, f)):
                      missing = True
                      break
+             if not missing:
+                 speech_dir = os.path.join(base_path, "speech_tokenizer")
+                 pattern = os.path.join(speech_dir, "model*.safetensors")
+                 if not (os.path.isdir(speech_dir) and glob.glob(pattern)):
+                     print(f"Speech tokenizer weights missing under {speech_dir}, will download GLM-TTS from HuggingFace.")
+                     missing = True
         
         if missing:
             print(f"Models missing in {base_path}. Attempting to download...")
@@ -353,9 +369,45 @@ class GLMTTSLoader:
         if base_path not in sys.path:
             sys.path.insert(0, base_path)
         try:
-            from cosyvoice.cli.frontend import TTSFrontEnd, SpeechTokenizer, TextFrontEnd
-            from utils import yaml_util, tts_model_util
-            from utils.audio import mel_spectrogram
+            glmtts_root = None
+            for _p in glmtts_src_candidates:
+                if os.path.isdir(_p):
+                    glmtts_root = _p
+                    break
+            if glmtts_root is None:
+                glmtts_root = base_path
+
+            def _load_module(name, path):
+                spec = importlib.util.spec_from_file_location(name, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                return module
+
+            cosy_frontend_mod = _load_module(
+                "glmtts_cosyvoice_frontend",
+                os.path.join(glmtts_root, "cosyvoice", "cli", "frontend.py"),
+            )
+            TTSFrontEnd = cosy_frontend_mod.TTSFrontEnd
+            SpeechTokenizer = cosy_frontend_mod.SpeechTokenizer
+            TextFrontEnd = cosy_frontend_mod.TextFrontEnd
+
+            yaml_util_mod = _load_module(
+                "glmtts_yaml_util",
+                os.path.join(glmtts_root, "utils", "yaml_util.py"),
+            )
+            yaml_util = yaml_util_mod
+
+            audio_mod = _load_module(
+                "glmtts_audio_util",
+                os.path.join(glmtts_root, "utils", "audio.py"),
+            )
+            mel_spectrogram = audio_mod.mel_spectrogram
+
+            tts_model_util_mod = _load_module(
+                "glmtts_tts_model_util",
+                os.path.join(glmtts_root, "utils", "tts_model_util.py"),
+            )
+            tts_model_util = tts_model_util_mod
         except Exception as e:
             raise ImportError(f"Failed to import GLM-TTS modules from {base_path}: {e}")
         
@@ -387,16 +439,35 @@ class GLMTTSLoader:
         glm_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         tokenize_fn = lambda text: glm_tokenizer.encode(text)
 
-        # Frontend dir for onnx
-        # frontend files (campplus.onnx) are downloaded with the model
-        frontend_dir = os.path.join(base_path, "frontend") 
+        frontend_dir = os.path.join(base_path, "frontend")
+        campplus_path = os.path.join(frontend_dir, "campplus.onnx")
+        if not os.path.exists(campplus_path):
+            fallback_candidates = [
+                os.path.join(glmtts_root, "frontend", "campplus.onnx"),
+                os.path.join(current_dir, "frontend", "campplus.onnx"),
+            ]
+            for _p in fallback_candidates:
+                if os.path.exists(_p):
+                    print(f"campplus.onnx not found under {frontend_dir}, using fallback: {_p}")
+                    campplus_path = _p
+                    break
+        if not os.path.exists(campplus_path):
+            raise FileNotFoundError(f"campplus.onnx not found in frontend dir or fallbacks: {campplus_path}")
+        spk2info_path = os.path.join(frontend_dir, "spk2info.pt")
+        if not os.path.exists(spk2info_path):
+            os.makedirs(frontend_dir, exist_ok=True)
+            try:
+                import torch as _torch_for_spk2info
+                _torch_for_spk2info.save({}, spk2info_path)
+            except Exception:
+                pass
         
         frontend = TTSFrontEnd(
             tokenize_fn,
             speech_tokenizer,
             feat_extractor,
-            os.path.join(frontend_dir, "campplus.onnx"),
-            os.path.join(frontend_dir, "spk2info.pt"),
+            campplus_path,
+            spk2info_path,
             DEVICE,
         )
         text_frontend = TextFrontEnd(use_phoneme)
