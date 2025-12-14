@@ -1,0 +1,37 @@
+[project]
+name = "glm_tts"
+description = "ComfyUI nodes for GLM-TTS, a high-quality text-to-speech system supporting zero-shot voice cloning."
+version = "1.0.0"
+license = {file = "LICENSE"} 
+# classifiers = [
+#     # For OS-independent nodes (works on all operating systems)
+#     "Operating System :: OS Independent",
+#
+#     # OR for OS-specific nodes, specify the supported systems:
+#     "Operating System :: Microsoft :: Windows",  # Windows specific
+#     "Operating System :: POSIX :: Linux",  # Linux specific
+#     "Operating System :: MacOS",  # macOS specific
+#
+#     # GPU Accelerator support. Pick the ones that are supported by your extension.
+#     "Environment :: GPU :: NVIDIA CUDA",    # NVIDIA CUDA support
+#     "Environment :: GPU :: AMD ROCm",       # AMD ROCm support
+#     "Environment :: GPU :: Intel Arc",      # Intel Arc support
+#     "Environment :: NPU :: Huawei Ascend",  # Huawei Ascend support
+#     "Environment :: GPU :: Apple Metal",    # Apple Metal support
+# ]
+
+dependencies = ["zhon", "zhconv", "inflect", "HyperPyYAML", "jieba", "pypinyin", "regex", "scipy", "soundfile", "huggingface_hub", "contractions", "# onnxruntime-gpu # Optional: Uncomment if you don't have onnxruntime installed. ComfyUI often has it."]
+
+[project.urls]
+Repository = "https://github.com/karas17/comfyui_GLM_TTS"
+#  Used by Comfy Registry https://registry.comfy.org
+Documentation = "https://github.com/karas17/comfyui_GLM_TTS/wiki"
+"Bug Tracker" = "https://github.com/karas17/comfyui_GLM_TTS/issues"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "comfyui_GLM_TTS"
+Icon = ""
+includes = [] 
+# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
+
