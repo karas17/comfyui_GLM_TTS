@@ -1,0 +1,4 @@
+# 250701
+pretrain_pattens: [
+  'grpo/data/0.jsonl',
+]

@@ -1,0 +1,1 @@
+{"uttid": "jiayan--sample-6-4_00", "prompt_text": "他当时还跟线下其他的站姐吵架，然后，打架进局子了。", "prompt_speech": "/your/project/examples/prompt/jiayan_zh.wav", "prompt_speech_token": "grpo/data/prompt_speech_token/jiayan.npy", "embedding": "grpo/data/embedding/jiayan.npy", "prompt_speech_feat": "grpo/data/prompt_speech_feat/jiayan.npy", "syn_text": "我觉得我们之间的沟通出现了问题，她好像完全不理解我的关心。", "emotion": 6}

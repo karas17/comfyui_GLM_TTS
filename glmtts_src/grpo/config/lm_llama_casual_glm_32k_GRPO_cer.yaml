@@ -1,0 +1,52 @@
+# train conf
+train_conf:
+  dtype: bf16
+  optim: adamw
+  optim_conf:
+    lr: 1e-6 # change to 1e-5 during sft
+    betas: [0.9, 0.95]
+  scheduler: constantlr # change to constantlr during sft  # cosine  # warmuplr
+  max_epoch: 1
+  final_step: 1000
+  grad_clip: 1
+  accum_grad: 1
+  log_interval: 100
+  save_per_step: 100 #save_per_step个step保存一次模型
+  # GRPO to be updated
+  num_answers_per_question: 8
+  batch_size: 1
+  micro_batch_size: 2
+  reward_weight:
+    cer_reward: 1
+    sim_reward: 0.1
+    emo_reward: 0
+    emo_neg_reward: 0
+    energy_reward: 0
+    pitch_reward: 0
+  policy_loss_type: ppo
+  clip_eps_low: 0.2
+  clip_eps_high: 0.3
+  generation_conf:
+    topp: 0.8
+    temperature: 1.0
+  kl_weight: 0
+  length_importance: False
+  # dynamic_T: 
+  #   start: 1
+  #   final_step: 1000
+  dynamic_clip_eps_high: 
+    start: 0.3
+    end: 0.5
+    final_step: 1000
+  dynamic_clip_eps_low: 
+    start: 0.2
+    end: 0.3
+    final_step: 1000
+  
+# model params
+# for all class/function included in this repo, we use !<name> or !<new> for intialization, so that user may find all corresponding class/function according to one single yaml.
+# for system/third_party class/function, we do not require this.
+llm: !new:llm.glmtts.GLMTTS
+  llama_cfg_path: ckpt/llm/config.json
+  mode: PRETRAIN
+  

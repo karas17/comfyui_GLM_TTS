@@ -1,0 +1,66 @@
+output/
+.wb_config.json
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Visual Studio Code files
+.vscode
+.vs
+
+# PyCharm files
+.idea
+
+# Eclipse Project settings
+*.*project
+.settings
+
+# Sublime Text settings
+*.sublime-workspace
+*.sublime-project
+
+# Editor temporaries
+*.swn
+*.swo
+*.swp
+*.swm
+*~
+
+# IPython notebook checkpoints
+.ipynb_checkpoints
+
+# macOS dir files
+.DS_Store
+
+exp
+raw_wav
+tensorboard
+**/*build*
+
+# Clangd files
+.cache
+compile_commands.json
+
+# train/inference files
+*.pt
+pretrained_models/*
+*_pb2_grpc.py
+*_pb2.py
+logs/
+wandb/
+/tools/g2p/
+error.txt
+outputs/
+outputs_sglang/
+outputs_*/
+output*/
+
+modules/*
+
+*pyc
+model_cache/*
+*embs.tar
+web_service/
+helps/
+ckpt/
