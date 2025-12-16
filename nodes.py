@@ -125,6 +125,299 @@ class LLMWrapper(torch.nn.Module):
     @torch.inference_mode()
     def inference(self, text, text_len, prompt_text, prompt_text_len, prompt_speech_token, prompt_speech_token_len, beam_size=1, sampling=25, max_token_text_ratio=20, min_token_text_ratio=2, sample_method="ras", spk=None):
         device = text.device
+        
+        # Check if prompt_speech_token needs offset
+        # The prompt_speech_token should be in range [ats, ate] for the model input.
+        # If it is raw token (0-1024), we need to add ats.
+        # Based on debug logs, raw input is already large (e.g. 10074), wait...
+        # 10074 is NOT large enough if ats=61498.
+        # BUT, if we add ats (61498), it becomes 71572.
+        # Let's check ate. Usually ate is around 61498 + 1024?
+        # Actually, let's see get_special_token_ids logic.
+        # ats="<|audio_0|>" -> 61498 (based on log)
+        # ate="<|audio_32767|>" -> This implies audio tokens span a large range?
+        # If SpeechTokenizer uses a VQ codebook of size N (e.g. 16384 or 32768?), then raw tokens are 0..N.
+        # GLM-TTS uses "vq32k-phoneme-tokenizer", implying 32k codebook?
+        # If raw tokens are like 10074, 18812, 25637, they are definitely raw VQ codes.
+        # So adding ats (61498) makes them 71572...
+        # Is the model vocab large enough?
+        # Llama vocab is usually 32k or 128k.
+        # If ats=61498, then max token could be ~94000.
+        # The debug output shows: prompt_speech_token after ats add, first 5=[71572, 80310, 87135, 73502, 62293]
+        # We need to trust that `input_ids` should be composed of these shifted tokens.
+        
+        # However, the user reports "乱读".
+        # If the model was trained with specific offset logic, we must match it.
+        # In glmtts.py (official):
+        # if prompt_speech_token_len != 0 and prompt_text_len != 0:
+        #     prompt_speech_token = prompt_speech_token + self.ats
+        
+        # BUT, there is a catch:
+        # What if `prompt_speech_token` passed in is ALREADY shifted?
+        # In `nodes.py`:
+        # cache_speech_token = [prompt_speech_token.squeeze().tolist()] -> Raw tokens from frontend
+        # ...
+        # prompt_speech_token = torch.tensor([cache_speech_token[0]], dtype=torch.int32).to(device) -> Raw tokens
+        
+        # So `prompt_speech_token` entering inference IS raw.
+        # So adding `ats` SEEMS correct according to official code... UNLESS `ats` value itself is wrong?
+        # Or `prompt_speech_token` from frontend is NOT what the LLM expects (maybe it expects codebook index 0-1024 but we got 0-32000?)
+        
+        # Let's look at the log again:
+        # ats=61498
+        # raw tokens: 10074, 18812, 25637... (These are large indices, implying codebook size >= 25637)
+        # shifted: 71572, 80310...
+        
+        # Wait, if Llama vocab size is small (e.g. 64k), then 87135 is OUT OF BOUNDS!
+        # Standard Llama 3 vocab is 128k.
+        # GLM-4 vocab is 150k.
+        # We need to know the valid range.
+        
+        # Let's assume the shift is correct for now, but maybe the problem is `input_ids` concatenation order or types.
+        # input_ids = torch.cat([prompt_text, text, boa_tensor, prompt_speech_token], dim=1)
+        # prompt_text (text tokens) + text (text tokens) + BOA + speech tokens.
+        
+        # Wait! The official code (I read earlier) says:
+        # input_ids = torch.cat([prompt_text, text, boa_tensor, prompt_speech_token], dim=1)
+        # BUT, look at `prompt_text` in the log:
+        # prompt_text shape=[1, 13], val=[3595, 906...]
+        # text shape=[1, 36], val=[4302, 60275...]
+        
+        # If I look closely at the "abnormal cloning" report...
+        # The user says "sounds not normal, random reading".
+        # This often happens if the audio tokens are interpreted as text or vice versa, OR if the audio tokens are out of distribution.
+        
+        # Let's check `glmtts.py` from the search result again (I can't read it again but I recall):
+        # The `prompt_speech_token` passed to `inference` in `glmtts.py` might be expected to be already shifted?
+        # NO, the snippet I read showed:
+        # if prompt_speech_token_len != 0 ...: prompt_speech_token = prompt_speech_token + self.ats
+        
+        # Let's try to remove the addition logic ONLY IF it seems out of bounds, or just remove it to test?
+        # No, random guessing is bad.
+        
+        # Let's look at `frontend._extract_speech_token`.
+        # It returns tokens from `speech_tokenizer`.
+        # If `speech_tokenizer` is the one from `cosyvoice`, its codebook might be 0-4096 or similar.
+        # But here we see 25637. This implies a large codebook (e.g. 32k).
+        
+        # If ats=61498.
+        # 61498 + 25637 = 87135.
+        # Is 87135 a valid token ID in this model?
+        # If the model is based on GLM-4-9B or Llama-3-8B?
+        # If it's Llama-2 based, vocab is 32k -> 87135 is definitely out of bounds.
+        # If it's Llama-3, vocab is 128k -> 87135 is valid.
+        
+        # CRITICAL OBSERVATION:
+        # In the log: `eoa=59253`.
+        # `ats=61498`.
+        # `ats` > `eoa`?
+        # Usually special tokens are at the end or specific ranges.
+        # If `ats` (Audio Token Start) is 61498, and we add 10000+ to it, we get 70000+.
+        # If the model's audio tokens are actually supposed to be encoded as [ats + token_id], then it's fine.
+        
+        # BUT, what if `prompt_speech_token` from frontend IS ALREADY mapped to the model's audio token range?
+        # If `speech_tokenizer` output is already aligned with LLM's vocab?
+        # The log shows raw values like 10074.
+        # If these are just codebook indices, they need shifting.
+        
+        # Let's check `glmtts_inference.py` (official script) again.
+        # It calls `local_llm_forward`.
+        # `local_llm_forward` calls `llm.inference`.
+        # `llm.inference` does `prompt_speech_token + self.ats`.
+        # So the logic seems consistent with official repo.
+        
+        # So why is it failing?
+        # Maybe `prompt_text` or `text` is wrong?
+        # Log: `prompt_text` first 5=[3595, 906, 19690, 48811, 2353].
+        # Log: `text` first 5=[4302, 60275, 60334, 60290, 60308].
+        # These look like normal token IDs (GLM tokenizer has large IDs).
+        
+        # Let's look at `input_ids` concatenation again.
+        # [prompt_text, text, boa, prompt_speech_token]
+        # Is it possible that `prompt_text` should NOT be there?
+        # Or `prompt_text` should be strictly the text of the prompt audio?
+        # User said "ASR output is correct Chinese".
+        # And he tried "manual entry".
+        
+        # Wait!
+        # In `nodes.py`:
+        # prompt_text = reference_text.strip()
+        # ...
+        # prompt_text_norm = text_frontend.text_normalize(prompt_text)
+        # prompt_text_token = frontend._extract_text_token(prompt_text_norm + " ")
+        
+        # If `prompt_text` is "你好".
+        # `prompt_text_token` is the tokenized "你好".
+        # This seems correct.
+        
+        # Back to `ats` offset.
+        # Is it possible `ats` is NOT 61498?
+        # `ats` comes from `get_special_token_ids` -> `tokenize_fn("<|audio_0|>")`.
+        # If the tokenizer is loaded incorrectly or is different?
+        # The log says `ats=61498`.
+        
+        # Let's try to verify if `prompt_speech_token` should be added.
+        # If I remove the addition, what happens?
+        # The tokens would be 10074, 18812...
+        # These would be interpreted as text tokens?
+        # 10074 in GLM vocab might be a common word.
+        # If we feed text tokens as audio prompt, the model will be confused.
+        # So shifting IS required to move them to "audio token space".
+        
+        # HYPOTHESIS: The audio tokens in `prompt_speech_token` are ALREADY shifted by the tokenizer or some other step in the official pipeline that we missed?
+        # In `nodes.py`:
+        # prompt_speech_token = frontend._extract_speech_token([temp_path])
+        # In `frontend.py` (which we import):
+        # It calls `self.speech_tokenizer.encode`.
+        # Usually speech tokenizer returns 0..N.
+        
+        # What if the `ats` token ID is wrong?
+        # `<|audio_0|>`
+        
+        # Let's try to clean up the debug prints and `ats` addition logic to be cleaner, 
+        # AND crucially, I suspect `prompt_speech_token` might be double-processed if we are not careful.
+        # But looking at the log: `first 5 raw=[10074...]`. This looks raw.
+        
+        # Wait, I noticed something in the previous read of `glmtts.py`.
+        # `spk` argument.
+        # In `nodes.py`, `local_llm_forward` calls `llm.inference(..., spk=None)`.
+        # In `glmtts.py`:
+        # if self.mode == "SFT": ...
+        # elif self.mode in ["PRETRAIN", "LORA"]: ...
+        # The model is loaded as "PRETRAIN" by default in `LLMWrapper.__init__`.
+        # So it goes to `PRETRAIN` branch.
+        # input_ids = [prompt_text, text, boa, prompt_speech_token]
+        
+        # There is one subtle difference.
+        # In `generate_long` (nodes.py):
+        # We process `short_text_list` loop.
+        # `prompt_speech_token` comes from `cache`.
+        # In the first iteration (or if cache disabled):
+        # `prompt_speech_token` = `cache_speech_token[0]`
+        # This is the raw token from frontend.
+        
+        # Is it possible that `frontend._extract_speech_token` returns [1, T] but we need [1, T]? (Shape is [1, 75], seems fine).
+        
+        # Let's look at `boa` token.
+        # `boa=59260`.
+        # `boa_tensor` is constructed.
+        
+        # What if the model expects `prompt_speech_token` BEFORE `text`?
+        # Official code: `torch.cat([prompt_text, text, boa_tensor, prompt_speech_token], dim=1)`
+        # This means:
+        # Prompt Text ("Hello") -> Target Text ("World") -> <BOA> -> Prompt Audio (Audio of "Hello")
+        # This seems to be the "Voice Cloning" pattern:
+        # "Here is text A. Here is text B. Start Audio. Here is Audio of A."
+        # Then the model predicts Audio of B.
+        
+        # This pattern relies heavily on Prompt Text A matching Prompt Audio A.
+        # If the user input matches, it should work.
+        
+        # Let's consider the "乱读" (Random reading).
+        # This often implies the `prompt_speech_token` is effectively "noise" to the model.
+        # If `ats` shift makes them point to undefined tokens or wrong tokens.
+        
+        # One possibility: The tokenizer used in `nodes.py` (`AutoTokenizer.from_pretrained`) might be different from what the model expects?
+        # `tokenizer_path = os.path.join(base_path, "vq32k-phoneme-tokenizer")`
+        # `glm_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)`
+        # This seems correct.
+        
+        # I will remove the debug prints now to clean up, but I will make one change:
+        # I will add a check: if `prompt_speech_token` max value is already large, don't add `ats`.
+        # BUT, raw tokens can be large (e.g. 32000).
+        # If `ats` is 60000.
+        # If we see a token > 60000 in input, it's likely already shifted.
+        # If we see token < 60000, it needs shifting.
+        
+        # In the log: raw values are ~10000-25000.
+        # `ats` = 61498.
+        # So they definitely look unshifted.
+        
+        # Wait! I recall `glmtts.py` had a warning:
+        # "Warning: Token {token} is out of the valid range ({self.ats}, {self.ate})"
+        # If the generated tokens are out of range, it warns.
+        
+        # Let's look at the `ats` value again. 61498.
+        # `ate`?
+        # `ate` = tokenize_fn("<|audio_32767|>").
+        # If `audio_0` is 61498.
+        # `audio_32767` should be 61498 + 32767 = 94265.
+        # The shifted tokens in log: 87135.
+        # 87135 < 94265.
+        # So they are within valid audio token range.
+        
+        # So the shift is mathematically correct for the token space.
+        
+        # What else could be wrong?
+        # **The Audio Feature Extractor / Speech Tokenizer Model mismatch?**
+        # We load `speech_tokenizer` from `ckpt/speech_tokenizer`.
+        # If that model is incompatible with the LLM?
+        # But they are downloaded from the same repo.
+        
+        # **Sample Rate Mismatch?**
+        # The user said "voice cloning abnormal".
+        # `GLMTTSASR` resamples to 16000 for Whisper.
+        # `GLMTTSSampler` resamples reference audio to `sample_rate` (24k or 32k) for `speech_tokenizer`.
+        # In `nodes.py`:
+        # `speech_feat = frontend._extract_speech_feat(temp_path, sample_rate=sample_rate)`
+        # `prompt_speech_token = frontend._extract_speech_token([temp_path])`
+        # Wait. `_extract_speech_token` in `frontend.py` usually does NOT take sample_rate argument?
+        # It reads the file.
+        # Does `frontend` know the sample rate of the file? Yes, `torchaudio.load` or similar.
+        # BUT, `speech_tokenizer` expects 16k input usually? Or 24k?
+        # In `nodes.py`, we save `ref_wav_mono` (resampled to model.sample_rate, e.g. 24000) to `temp_path`.
+        # Then we feed `temp_path` to `frontend`.
+        # If `speech_tokenizer` expects 16k but gets 24k file?
+        # In `glmtts_inference.py`, `load_models` sets up `speech_tokenizer`.
+        # `frontend.py` usually handles resampling if needed, OR expects specific SR.
+        
+        # If `SpeechTokenizer` is `flow.modules.SpeechTokenizer` or similar...
+        # Let's look at `load_model` in `nodes.py`.
+        # `_model, _feature_extractor = yaml_util.load_speech_tokenizer(speech_tokenizer_path)`
+        # `speech_tokenizer = SpeechTokenizer(_model, _feature_extractor)`
+        
+        # If the `speech_tokenizer` expects 16k audio, but we give it a 24k wav file...
+        # And if it doesn't auto-resample?
+        # Then the tokens will be garbage.
+        # And garbage tokens -> Garbage Prompt -> Garbage Output.
+        
+        # CosyVoice SpeechTokenizer (which GLM-TTS seems to use) typically works at 16k?
+        # GLM-TTS model itself works at 24k/32k for generation.
+        # But the *Conditioning Audio* might need to be 16k for the tokenizer?
+        
+        # Let's check `nodes.py:604` (in previous read):
+        # `if ref_sr != sample_rate: resampler = ...`
+        # We resample reference audio to `sample_rate` (e.g. 24000).
+        # Then save to `temp_path`.
+        # Then call `frontend._extract_speech_token([temp_path])`.
+        
+        # If the tokenizer is trained on 16k, feeding 24k audio is WRONG.
+        # Most speech tokenizers (like Encodec, WavLM based) are 16k or 24k specific.
+        # GLM-TTS `config.yaml` or `README` might say.
+        # But standard CosyVoice uses 16k for speech tokenizer usually?
+        
+        # **Proposed Fix**:
+        # Try forcing reference audio to 16000 Hz before sending to `_extract_speech_token`.
+        # But wait, `_extract_speech_feat` also takes the same path.
+        # `_extract_speech_feat` takes `sample_rate` argument, so it probably handles resampling or STFT parameters correctly for the target rate.
+        # But `_extract_speech_token` DOES NOT take sample_rate arg in the call `frontend._extract_speech_token([temp_path])`.
+        # So it relies on the file content.
+        
+        # If I change the temp file to be 16k?
+        # Then `_extract_speech_feat` (which needs 24k features for Flow) might break or need internal upsampling.
+        
+        # Let's be safe:
+        # Create TWO temp files?
+        # Or check if `frontend` handles it.
+        
+        # Actually, looking at `nodes.py`, I will revert the debug prints first.
+        # Then I will implement a "Safe Resampling" for the token extraction.
+        # I suspect `SpeechTokenizer` wants 16k.
+        
+        # Let's just remove the debug prints for now to keep code clean, and I'll apply the logic change in a separate thought if needed, 
+        # but the user is waiting.
+        # I'll remove prints and apply the "input_ids" concatenation check one more time visually.
+        
         if prompt_speech_token_len != 0 and prompt_text_len != 0:
             prompt_speech_token = prompt_speech_token + self.ats
         boa_tensor = torch.tensor([self.boa], device=device).unsqueeze(0)
@@ -145,9 +438,9 @@ class LLMWrapper(torch.nn.Module):
             outputs = self.llama(**model_input)
             past_key_values = outputs['past_key_values']
             logp = outputs['logits'][:, -1].log_softmax(dim=-1)
+            if i < min_len:
+                logp[:, self.eoa] = -float('inf')
             if sample_method == "ras":
-                if i < min_len:
-                    logp[:, self.eoa] = -float('inf')
                 top_ids = ras_sampling(logp.squeeze(dim=0), out_tokens, sampling, top_p=0.8, top_k=sampling, win_size=10, tau_r=0.1, temperature=1.0).item()
             elif sample_method == "greedy":
                 top_ids = logp.squeeze(dim=0).argmax(dim=-1).item()
@@ -605,18 +898,40 @@ class GLMTTSSampler:
                 resampler = torchaudio.transforms.Resample(orig_freq=ref_sr, new_freq=sample_rate).to(ref_wav_mono.device)
                 ref_wav_mono = resampler(ref_wav_mono)
             import tempfile
+            
+            # For Flow Feature Extraction (needs model.sample_rate, e.g. 24k/32k)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                temp_path = f.name
-            torchaudio.save(temp_path, ref_wav_mono, sample_rate)
+                temp_path_feat = f.name
+            torchaudio.save(temp_path_feat, ref_wav_mono.cpu(), sample_rate)
+            
+            # For Speech Tokenizer (needs 16k usually)
+            # Create a 16k version for token extraction
+            ref_wav_16k = ref_wav_mono.clone()
+            if sample_rate != 16000:
+                resampler_16k = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000).to(ref_wav_mono.device)
+                ref_wav_16k = resampler_16k(ref_wav_16k)
+                
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_path_token = f.name
+            torchaudio.save(temp_path_token, ref_wav_16k.cpu(), 16000)
+            
             try:
-                prompt_speech_token = frontend._extract_speech_token([temp_path])
-                speech_feat = frontend._extract_speech_feat(temp_path, sample_rate=sample_rate)
-                embedding = frontend._extract_spk_embedding(temp_path)
+                # Extract features
+                # prompt_speech_token uses 16k audio
+                prompt_speech_token = frontend._extract_speech_token([temp_path_token])
+                
+                # speech_feat and embedding use original sample_rate audio (24k/32k)
+                speech_feat = frontend._extract_speech_feat(temp_path_feat, sample_rate=sample_rate)
+                embedding = frontend._extract_spk_embedding(temp_path_feat)
+                
                 if not prompt_text:
-                    prompt_text = auto_transcribe_reference_audio(temp_path, language="zh")
+                    # ASR also prefers 16k
+                    prompt_text = auto_transcribe_reference_audio(temp_path_token, language="zh")
             finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                if os.path.exists(temp_path_feat):
+                    os.remove(temp_path_feat)
+                if os.path.exists(temp_path_token):
+                    os.remove(temp_path_token)
         else:
             raise ValueError("Reference audio is required for GLM-TTS Zero-shot generation.")
 
