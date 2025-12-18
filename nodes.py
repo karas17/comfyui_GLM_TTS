@@ -548,6 +548,7 @@ def generate_long(
     embedding,
     seed=0,
     sample_method="ras",
+    sampling=25,
     flow_prompt_token=None,
     speech_feat=None,
     use_phoneme=False,
@@ -564,6 +565,7 @@ def generate_long(
         "syn_text_phoneme": [],
     }
     short_text_list = text_frontend.split_by_len(syn_text)
+    llm_disable_audio_prompt = sample_method == "topk" and sampling == 1
     for _, tts_text in enumerate(short_text_list):
         set_seed(seed)
         tts_text_tn = text_frontend.text_normalize(tts_text)
@@ -575,16 +577,20 @@ def generate_long(
         cache_text = cache["cache_text"]
         cache_text_token = cache["cache_text_token"]
         cache_speech_token = cache["cache_speech_token"]
-        if cache["use_cache"] and len(cache_text_token) > 1:
+        if cache["use_cache"] and len(cache_text_token) > 1 and not llm_disable_audio_prompt:
             prompt_text_token, prompt_speech_token = get_cached_prompt(cache, tts_text_token, device)
         else:
             prompt_text_token = cache_text_token[0].to(device)
-            prompt_speech_token = torch.tensor([cache_speech_token[0]], dtype=torch.int32).to(device)
+            if llm_disable_audio_prompt:
+                prompt_speech_token = torch.zeros((1, 0), dtype=torch.int32).to(device)
+            else:
+                prompt_speech_token = torch.tensor([cache_speech_token[0]], dtype=torch.int32).to(device)
         token_list_res = local_llm_forward(
             llm=llm,
             prompt_text_token=prompt_text_token,
             tts_text_token=tts_text_token,
             prompt_speech_token=prompt_speech_token,
+            sampling=sampling,
             sample_method=sample_method
         )
         output_token_list.extend(token_list_res)
@@ -787,9 +793,12 @@ class GLMTTSLoader:
         else:
              feat_extractor = partial(mel_spectrogram, sampling_rate=sample_rate, hop_size=480, n_fft=1920, num_mels=80, win_size=1920, fmin=0, fmax=8000, center=False)
 
-        tokenizer_path = os.path.join(base_path, "vq32k-phoneme-tokenizer")
-        glm_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        tokenize_fn = lambda text: glm_tokenizer.encode(text)
+        glm_tokenizer = AutoTokenizer.from_pretrained(
+            os.path.join(base_path, "vq32k-phoneme-tokenizer"),
+            trust_remote_code=True,
+        )
+        def tokenize_fn(text):
+            return glm_tokenizer.encode(text)
 
         frontend_dir = os.path.join(base_path, "frontend")
         campplus_path = os.path.join(frontend_dir, "campplus.onnx")
@@ -824,12 +833,18 @@ class GLMTTSLoader:
         )
         text_frontend = TextFrontEnd(use_phoneme)
 
-        # 3. Load LLM
+        # 3. Load LLM (use official GLMTTS implementation to match reference behavior)
         llama_path = os.path.join(base_path, "llm")
-        llm_model = LLMWrapper(
+        from llm.glmtts import GLMTTS
+        llm_model = GLMTTS(
             llama_cfg_path=os.path.join(llama_path, "config.json"),
-            llama_path=llama_path
+            mode="PRETRAIN",
+            spk_prompt_dict_path=None,
         )
+        llm_model.llama = LlamaForCausalLM.from_pretrained(
+            llama_path, dtype=torch.float32
+        ).to(DEVICE)
+        llm_model.llama_embedding = llm_model.llama.model.embed_tokens
 
         special_token_ids = get_special_token_ids(frontend.tokenize_fn)
         llm_model.set_runtime_vars(special_token_ids=special_token_ids)
@@ -894,44 +909,19 @@ class GLMTTSSampler:
             ref_wav_mono = ref_wav[0]
             if ref_wav_mono.shape[0] > 1:
                 ref_wav_mono = torch.mean(ref_wav_mono, dim=0, keepdim=True)
-            if ref_sr != sample_rate:
-                resampler = torchaudio.transforms.Resample(orig_freq=ref_sr, new_freq=sample_rate).to(ref_wav_mono.device)
-                ref_wav_mono = resampler(ref_wav_mono)
             import tempfile
-            
-            # For Flow Feature Extraction (needs model.sample_rate, e.g. 24k/32k)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                temp_path_feat = f.name
-            torchaudio.save(temp_path_feat, ref_wav_mono.cpu(), sample_rate)
-            
-            # For Speech Tokenizer (needs 16k usually)
-            # Create a 16k version for token extraction
-            ref_wav_16k = ref_wav_mono.clone()
-            if sample_rate != 16000:
-                resampler_16k = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000).to(ref_wav_mono.device)
-                ref_wav_16k = resampler_16k(ref_wav_16k)
-                
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                temp_path_token = f.name
-            torchaudio.save(temp_path_token, ref_wav_16k.cpu(), 16000)
-            
+                temp_path = f.name
+            torchaudio.save(temp_path, ref_wav_mono.cpu(), ref_sr)
             try:
-                # Extract features
-                # prompt_speech_token uses 16k audio
-                prompt_speech_token = frontend._extract_speech_token([temp_path_token])
-                
-                # speech_feat and embedding use original sample_rate audio (24k/32k)
-                speech_feat = frontend._extract_speech_feat(temp_path_feat, sample_rate=sample_rate)
-                embedding = frontend._extract_spk_embedding(temp_path_feat)
-                
+                prompt_speech_token = frontend._extract_speech_token([temp_path])
+                speech_feat = frontend._extract_speech_feat(temp_path, sample_rate=sample_rate)
+                embedding = frontend._extract_spk_embedding(temp_path)
                 if not prompt_text:
-                    # ASR also prefers 16k
-                    prompt_text = auto_transcribe_reference_audio(temp_path_token, language="zh")
+                    prompt_text = auto_transcribe_reference_audio(temp_path, language="zh")
             finally:
-                if os.path.exists(temp_path_feat):
-                    os.remove(temp_path_feat)
-                if os.path.exists(temp_path_token):
-                    os.remove(temp_path_token)
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
         else:
             raise ValueError("Reference audio is required for GLM-TTS Zero-shot generation.")
 
@@ -949,7 +939,17 @@ class GLMTTSSampler:
             "cache_speech_token": cache_speech_token,
             "use_cache": use_cache,
         }
-        
+
+        if sample_method == "ras":
+            llm_sample_method = "ras"
+            llm_sampling = 25
+        elif sample_method == "greedy":
+            llm_sample_method = "topk"
+            llm_sampling = 1
+        else:
+            llm_sample_method = "topk"
+            llm_sampling = 25
+
         tts_speech, tts_mel, output_token_list, text_tn_dict = generate_long(
             frontend=frontend,
             text_frontend=text_frontend,
@@ -960,10 +960,11 @@ class GLMTTSSampler:
             device=DEVICE,
             embedding=embedding,
             seed=seed,
-            sample_method=sample_method,
+            sample_method=llm_sample_method,
+            sampling=llm_sampling,
             flow_prompt_token=flow_prompt_token,
             speech_feat=speech_feat,
-            use_phoneme=model.text_frontend.use_phoneme # verify this attr exists or check initialization
+            use_phoneme=model.text_frontend.use_phoneme
         )
         
         out_wav = tts_speech.unsqueeze(0).cpu() # [1, 1, samples]
